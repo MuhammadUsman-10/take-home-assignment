@@ -519,4 +519,186 @@ A standalone Express server (`mock-hcm/`) simulates the HCM system:
 
 ---
 
+## 17. Edge Cases
+
+This section documents every significant edge case — which are **resolved in the current implementation** and which remain **open risks** for future work.
+
+### 17.1 Resolved Edge Cases ✅
+
+These are handled by the current implementation and covered by tests.
+
+| Edge Case | How It's Resolved |
+|---|---|
+| **Two concurrent submissions against the same balance** | Optimistic locking (`@VersionColumn`) on the `Balance` entity. The second writer detects a version mismatch and retries up to 3× with exponential backoff (50ms → 100ms → 150ms). If all retries fail, a `ConflictException` is returned. |
+| **Employee submits while batch sync is running** | Batch sync operates inside a database transaction. The submission sees a fully consistent balance snapshot — it cannot observe a partial sync. |
+| **Duplicate idempotency key (same request sent twice)** | The service checks for an existing `TimeOffRequest` with the same `idempotencyKey` before executing. If found, the stored response is returned immediately — no side effects. |
+| **Duplicate webhook (same HCM event delivered twice)** | Webhook handler performs an idempotent upsert (`INSERT OR REPLACE` semantics). The second identical payload overwrites the same values — the final state is identical. |
+| **HCM API unavailable at submission time** | The request is saved as `PENDING` after the local reservation is made. The async HCM call fails silently. The batch reconciliation job (every 15 min) will retry. The employee is not blocked. |
+| **HCM rejects the request after local reservation** | The async HCM callback receives a `REJECTED` status. `releaseReservation` is called, restoring `reservedDays`. The request status is set to `REJECTED`. |
+| **Batch sync reveals HCM balance is lower than local reserved** | Conflict detected: `reservedDays > (HCM_totalDays - HCM_usedDays)`. Affected `PENDING` requests are flagged `NEEDS_REVALIDATION`. Conflict logged to `SyncLog`. Manager must explicitly resolve. |
+| **Employee cancels a PENDING request** | `reservedDays -= days` is applied atomically before status is set to `CANCELLED`. Guard prevents cancellation of non-PENDING requests. |
+| **Cross-employee cancellation attempt** | Guard checks `request.employeeId === requestingEmployeeId`. Returns `400 Bad Request` if mismatched. |
+| **Employee tries to use a manager-only endpoint** | `@Roles('manager')` decorator on the controller method. `RolesGuard` returns `403 Forbidden`. |
+| **Request with negative days** | DTO-level validation via `class-validator` (`@Min(0.5)`). Returns `400 Bad Request` before any logic runs. |
+| **Start date is after end date** | Date range validation in service layer. Returns `400 Bad Request`. |
+| **Fractional days (half-day requests)** | `days` field is typed as `real` (float) in SQLite. The formula `availableDays = totalDays - usedDays - reservedDays` supports `0.5` increments. |
+| **Invalid HCM location/leave-type combination** | HCM returns a `400`. The service propagates this as a `BadRequestException` with a clear message to the employee. |
+| **HCM network timeout** | `axios` is configured with a timeout (default: 10s). On timeout, the request stays `PENDING` and the sync log records a `FAILURE` entry. |
+
+---
+
+### 17.2 Known Open Edge Cases ⚠️
+
+These are identified risks that are **not fully handled** in the current implementation and represent concrete future work.
+
+| Edge Case | Risk | Recommended Fix |
+|---|---|---|
+| **Employee cancels exactly as HCM approves (race condition)** | Cancel releases the reservation. The concurrent HCM approval callback then tries to call `confirmReservation` on 0 reserved days. The `Math.max(0, ...)` guard prevents it from going negative, but the request status may be inconsistent (CANCELLED + APPROVED both attempted). | Use a distributed advisory lock or a database-level `SELECT FOR UPDATE` on the `TimeOffRequest` row during status transitions. Alternatively, introduce a terminal state check before any status update. |
+| **PENDING request orphaned when HCM never responds** | If the HCM call fails silently (no response, no webhook), the request stays `PENDING` indefinitely and `reservedDays` is never released. | Add a recovery cron job: every 30 minutes, find all `PENDING` requests older than X minutes and re-trigger the HCM call. If HCM still does not respond after Y attempts, auto-cancel and release the reservation. |
+| **Idempotency key scoped globally, not per employee** | Two different employees using the same `idempotencyKey` string will collide — the second employee receives the first employee's response. | Scope idempotency checks to `(employeeId + idempotencyKey)` composite key. Add a unique index on `(employeeId, idempotencyKey)`. |
+| **Business days not validated locally** | `days` is caller-supplied. An employee could submit a request for `5 days` that spans a weekend with only 2 actual working days. ReadyOn trusts the client's `days` value. HCM may or may not validate this. | Integrate a working-days calculation library (e.g. `date-holidays`) and validate that `days` matches the number of business days between `startDate` and `endDate` for the employee's location. |
+| **`availableDays` can go negative** | If HCM data is corrupted (e.g., `usedDays > totalDays`), `availableDays` becomes negative. No application-level guard exists. | Add a `CHECK (total_days >= used_days + reserved_days)` database constraint. At application level, throw a `DataIntegrityException` and alert ops if this is ever violated. |
+| **Approved request cannot be cancelled** | Once `APPROVED`, an employee cannot cancel. Real HR systems require a reversal/cancellation-after-approval flow. | Implement a reversal request: a new `TimeOffRequest` of type `REVERSAL` that files a negative balance adjustment with HCM. On HCM approval, `usedDays -= N` is applied. |
+| **No notification on NEEDS_REVALIDATION** | Managers are not alerted when batch sync flags requests as `NEEDS_REVALIDATION`. Without a notification, the conflict may sit unresolved for days. | Integrate an email/Slack notification on status transition to `NEEDS_REVALIDATION`. Expose a dashboard endpoint for managers to see all unresolved conflicts. |
+| **Single `lastSyncedAt` timestamp per balance** | If real-time sync succeeds but the webhook-based sync fails silently, `lastSyncedAt` still shows a recent value. Staleness cannot be distinguished by sync type. | Add separate `lastRealtimeSyncedAt`, `lastWebhookSyncedAt`, `lastBatchSyncedAt` columns for fine-grained observability. |
+
+---
+
+## 18. Scalability
+
+### 18.1 Current State (Stage 1 — Single Instance, SQLite)
+
+The current implementation is intentionally designed for simplicity and correctness over raw scale. It is appropriate for small-to-medium organisations (< 500 employees, < 50 concurrent requests).
+
+```
+Employee UI
+    │
+    ▼
+NestJS (1 instance)
+    │
+    ├── SQLite (local file DB)        ← Single writer, limited concurrency
+    │
+    └── HCM API (external)
+```
+
+**Bottlenecks at this stage:**
+- SQLite allows only one writer at a time. Under burst load, requests queue behind the write lock.
+- A single NestJS instance is not fault-tolerant. If the process crashes, all in-flight requests are lost.
+- The 15-minute cron job runs inside the same process — it competes with request handlers for memory.
+
+**Realistic capacity:** ~50–100 requests/second with sub-200ms P99.
+
+---
+
+### 18.2 Stage 2 — PostgreSQL + Horizontal Scaling
+
+Replace SQLite with PostgreSQL and deploy multiple NestJS instances behind a load balancer. This is the primary production target.
+
+```
+Employee UI
+    │
+    ▼
+Load Balancer (NGINX / AWS ALB)
+    │
+    ├── NestJS Instance 1 ─┐
+    ├── NestJS Instance 2 ─┤── PostgreSQL (Primary + Read Replica)
+    └── NestJS Instance N ─┘
+                           │
+                       HCM API
+```
+
+**What changes:**
+
+| Component | Current (Stage 1) | Stage 2 |
+|---|---|---|
+| Database | SQLite (file-based) | PostgreSQL (server-based) |
+| Concurrency model | Optimistic locking (SQLite constraints) | Optimistic locking OR `SELECT FOR UPDATE` on the balance row |
+| NestJS instances | 1 | N (stateless — JWT means no session affinity needed) |
+| Scheduled cron | Runs in every instance | Distribute using a leader-election lock (e.g. `pg_advisory_lock`) or move to a dedicated worker |
+| Fault tolerance | None | Process manager (PM2), container orchestration (Kubernetes) |
+
+**Code change required:** In `app.module.ts`, replace `better-sqlite3` TypeORM driver with `postgres`. The business logic, optimistic locking mechanism, and all service code are **driver-agnostic** — no rewrites needed.
+
+**Realistic capacity:** Thousands of requests/second with proper connection pooling (PgBouncer).
+
+---
+
+### 18.3 Stage 3 — Event-Driven, Multi-Service
+
+Decouple the HCM sync concern from the request-handling path entirely using an event streaming platform (Kafka or AWS SQS).
+
+```
+Employee UI
+    │
+    ▼
+API Gateway
+    │
+    ▼
+Time-Off Service (NestJS) ──── PostgreSQL
+    │
+    ├── Publishes: "time-off-request.submitted"
+    │               "time-off-request.cancelled"
+    │
+    ▼
+Kafka / AWS SQS
+    │
+    ├── HCM Sync Consumer ───── HCM API (Workday / SAP)
+    │       ↓ publishes: "hcm.balance-updated"
+    │
+    └── Notification Consumer ── Email / Slack
+```
+
+**What this unlocks:**
+
+| Capability | How |
+|---|---|
+| **Near-real-time HCM sync** | HCM publishes to Kafka on every balance change. ReadyOn subscribes and applies updates within seconds — eliminates the 15-minute polling lag entirely. |
+| **Independent scaling of sync vs serving** | The HCM consumer can be scaled independently based on HCM event volume, without touching the request-serving tier. |
+| **Built-in retry and dead-letter queue** | Kafka/SQS retries failed HCM calls automatically. Failed messages go to a DLQ for manual inspection — no lost updates. |
+| **Decoupled notification pipeline** | A separate consumer handles `NEEDS_REVALIDATION` alerts — removing that responsibility from the core service. |
+| **Multi-region readiness** | Kafka topics can be replicated across regions. Each region runs its own Time-Off Service consumer group. |
+
+**Trade-offs:** Requires Kafka/SQS infrastructure, consumer service deployment, schema registry for event versioning, and operational expertise. Recommended when team size and request volume justify the overhead.
+
+**Realistic capacity:** Millions of events/day with horizontal scaling of each tier independently.
+
+---
+
+### 18.4 Scalability at a Glance
+
+| Dimension | Stage 1 (Today) | Stage 2 (PostgreSQL) | Stage 3 (Event-Driven) |
+|---|---|---|---|
+| **Throughput** | ~100 req/s | ~10,000 req/s | Horizontally unlimited |
+| **Fault tolerance** | None | Container restart (K8s) | Full — each service independent |
+| **HCM sync lag** | ≤ 15 min (batch) | ≤ 15 min (batch) | < 5 seconds (event-driven) |
+| **Database** | SQLite | PostgreSQL | PostgreSQL + read replicas |
+| **Deployment complexity** | Single binary | K8s Deployment | K8s + Kafka + consumers |
+| **Recommended for** | Prototype / interview | Production (< 50k employees) | Large enterprise / multi-region |
+
+---
+
+## 19. Current vs Future Implementation
+
+This section maps every key design decision to its current implementation and the recommended production-grade upgrade.
+
+| Concern | Current Implementation | Future Implementation |
+|---|---|---|
+| **Database** | SQLite (`better-sqlite3`) — simple, zero-config, file-based | PostgreSQL — concurrent writes, row-level locking, JSONB, connection pooling |
+| **Concurrency control** | Optimistic locking with 3× retry at application layer | `SELECT FOR UPDATE` on the balance row (PostgreSQL advisory locks for distributed locking) |
+| **HCM sync** | 3-layer: real-time pull, webhook push, 15-min batch cron | HCM publishes events to Kafka; ReadyOn subscribes — eliminates polling entirely |
+| **HCM error handling** | Async call with retry (3×, exponential backoff) | Circuit breaker (Opossum) — fail-fast after N consecutive failures; half-open probe to detect recovery |
+| **Cron scheduling** | NestJS `@Cron` inside the application process | Dedicated worker process or scheduled Kubernetes CronJob — no competition with request handlers |
+| **Idempotency** | Global `idempotencyKey` field on requests | Composite unique index on `(employeeId, idempotencyKey)` — prevent cross-employee collision |
+| **PENDING recovery** | None — orphaned PENDING requests stay PENDING | Recovery cron: find PENDING requests older than 30 min, re-trigger HCM call or auto-cancel |
+| **Business day validation** | Caller-supplied `days` field is trusted | Server-side validation using `date-holidays` library for the employee's location/country |
+| **Approved request cancellation** | Not supported | Reversal request flow — file negative balance adjustment with HCM |
+| **Notifications** | None | Event-driven notification consumer — email/Slack on `NEEDS_REVALIDATION`, rejection, and approval |
+| **Observability** | Structured request logging + SyncLog audit table | OpenTelemetry distributed tracing, Prometheus metrics, Grafana dashboards |
+| **Auth** | JWT Bearer (self-signed) | OAuth2 / OIDC integration with the corporate identity provider (Okta, Azure AD) |
+| **Deployment** | `node dist/main` (single process) | Docker container → Kubernetes Deployment with liveness/readiness probes, auto-scaling HPA |
+| **Multi-region** | Not supported | Active-active via Kafka replication; PostgreSQL global via CockroachDB or Aurora Global |
+| **Secret management** | `.env` file | HashiCorp Vault or AWS Secrets Manager — secrets injected at runtime, rotated without redeployment |
+
+---
+
 *This document represents the merged and refined design from collaborative review of multiple design proposals.*
